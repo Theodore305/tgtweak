@@ -1,0 +1,24 @@
+name: build
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Theos
+        run: |
+          git clone --recursive https://github.com/theos/theos.git $HOME/theos
+          echo "THEOS=$HOME/theos" >> $GITHUB_ENV
+      - name: Build
+        run: make
+      - name: Fix install name and show dependencies
+        run: |
+          install_name_tool -id @rpath/TelegramCallTweak.dylib .theos/obj/TelegramCallTweak.dylib
+          otool -L .theos/obj/TelegramCallTweak.dylib
+          file .theos/obj/TelegramCallTweak.dylib
+      - uses: actions/upload-artifact@v4
+        with:
+          name: TelegramCallTweak
+          path: .theos/obj/TelegramCallTweak.dylib

@@ -1,0 +1,9 @@
+Package: com.local.telegramcalltweak
+Name: TelegramCallTweak
+Version: 1.1.0
+Architecture: iphoneos-arm
+Description: Call settings for Telegram: mic/screen-audio volume, force built-in mic, audio-only screen share
+Maintainer: you
+Author: you
+Section: Tweaks
+Depends: mobilesubstrate
