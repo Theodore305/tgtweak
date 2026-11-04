@@ -6,7 +6,7 @@ include $(THEOS)/makefiles/common.mk
 
 TWEAK_NAME = TelegramCallTweak
 TelegramCallTweak_FILES = Tweak.mm
-TelegramCallTweak_FRAMEWORKS = UIKit AVFoundation CoreMedia
+TelegramCallTweak_FRAMEWORKS = UIKit AVFoundation CoreMedia AudioToolbox
 TelegramCallTweak_CFLAGS = -fobjc-arc -Wno-deprecated-declarations
 # the tweak doesn't use Substrate APIs: drop unused dylib dependencies so it injects cleanly via Sideloadly
 TelegramCallTweak_LDFLAGS = -Wl,-dead_strip_dylibs

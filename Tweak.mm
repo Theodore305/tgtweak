@@ -4,7 +4,7 @@
 //     (fallback: small floating 🎧 button if that screen can't be hooked)
 //   * Force built-in mic (keeps Bluetooth/headphones for output only)
 //   * Share Audio Only (drops screen-share video frames, keeps the audio)
-//   * Screen media volume / microphone volume
+//   * Screen media volume / microphone volume (0-300%, applied to the samples AudioUnitRender returns)
 //
 // Everything is resolved at runtime (class lookup by name, hooks installed with retries),
 // so a renamed Swift module prefix or a late-loaded image no longer breaks the tweak.
@@ -12,6 +12,12 @@
 #import <UIKit/UIKit.h>
 #import <AVFoundation/AVFoundation.h>
 #import <CoreMedia/CoreMedia.h>
+#import <AudioToolbox/AudioToolbox.h>
+#import <dlfcn.h>
+#import <mach-o/loader.h>
+#import <mach-o/nlist.h>
+#import <sys/mman.h>
+#import <string.h>
 #import <objc/runtime.h>
 #import <mach-o/dyld.h>
 #import <atomic>
@@ -85,14 +91,6 @@ static void ApplyBuiltInMic(void) {
     }
 }
 
-// Best effort: iOS only lets us change input gain when the current input reports it as settable.
-static void ApplyMicGain(void) {
-    AVAudioSession *s = AVAudioSession.sharedInstance;
-    if (!s.isInputGainSettable) return;
-    float g = fminf(1.f, fmaxf(0.f, gMicVol.load() / 100.f));
-    [s setInputGain:g error:nil];
-}
-
 static NSString *RouteDescription(void) {
     AVAudioSessionRouteDescription *r = AVAudioSession.sharedInstance.currentRoute;
     AVAudioSessionPortDescription *in = r.inputs.firstObject, *out = r.outputs.firstObject;
@@ -114,7 +112,7 @@ static NSInteger gRouteSeq = 0;
 }
 - (void)audioRouteChanged:(NSNotification *)n {
     dispatch_async(dispatch_get_main_queue(), ^{
-        ApplyBuiltInMic(); ApplyMicGain();
+        ApplyBuiltInMic();
         // Diagnostic toast while a call/recording session is active: shows where mic and sound really go.
         NSInteger seq = ++gRouteSeq;
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
@@ -137,7 +135,7 @@ static AVAudioSessionCategoryOptions AdjustOptions(NSString *cat, AVAudioSession
 }
 
 static void AfterCategoryChange(void) {
-    dispatch_async(dispatch_get_main_queue(), ^{ ApplyBuiltInMic(); ApplyMicGain(); });
+    dispatch_async(dispatch_get_main_queue(), ^{ ApplyBuiltInMic(); });
 }
 
 static AVAudioSessionCategoryOptions (*orig_categoryOptions)(id, SEL);
@@ -201,14 +199,14 @@ static void hook_submitSampleBuffer(id self, SEL _cmd, CMSampleBufferRef sb, NSI
 
 #pragma mark - Settings UI
 
-static BOOL gHookAudio = NO, gHookVideo = NO, gHookSession = NO, gHookSettings = NO;
+static BOOL gHookAudio = NO, gHookVideo = NO, gHookSession = NO, gHookSettings = NO, gHookMic = NO;
 static BOOL gRowWanted = NO;                       // a profile/settings screen is on screen
 static NSHashTable *gVisibleProfiles;              // weak: visible PeerInfoScreenImpl instances
 static void RefreshSettingsRow(void);
 
 static NSString *HookStatus(void) {
-    return [NSString stringWithFormat:@"Hooks: звук экрана %@ · видео %@ · аудиосессия %@ · экран настроек %@",
-            gHookAudio ? @"✓" : @"✗", gHookVideo ? @"✓" : @"✗", gHookSession ? @"✓" : @"✗", gHookSettings ? @"✓" : @"✗"];
+    return [NSString stringWithFormat:@"Hooks: звук экрана %@ · видео %@ · аудиосессия %@ · экран настроек %@ · усиление микрофона %@",
+            gHookAudio ? @"✓" : @"✗", gHookVideo ? @"✓" : @"✗", gHookSession ? @"✓" : @"✗", gHookSettings ? @"✓" : @"✗", gHookMic ? @"✓" : @"✗"];
 }
 
 @interface TweakSettingsViewController : UIViewController <UITableViewDataSource, UITableViewDelegate>
@@ -267,7 +265,7 @@ static NSString *HookStatus(void) {
         l.translatesAutoresizingMaskIntoConstraints = NO;
         UISlider *s = [UISlider new];
         s.minimumValue = 0;
-        s.maximumValue = mic ? 100 : 200;   // mic gain can't exceed the hardware maximum
+        s.maximumValue = mic ? 300 : 200;
         s.translatesAutoresizingMaskIntoConstraints = NO;
         float v = mic ? gMicVol.load() : gMediaVol.load();
         [s setValue:v animated:NO];
@@ -303,7 +301,6 @@ static NSString *HookStatus(void) {
         [self.mediaSlider setValue:100 animated:YES];
         self.micLabel.text = @"Microphone Voice Volume (100%)";
         self.mediaLabel.text = @"Screen Media Volume (100%)";
-        ApplyMicGain();
     }
 }
 
@@ -320,7 +317,6 @@ static NSString *HookStatus(void) {
     float v = roundf(s.value);
     gMicVol = v; SavePref(kMicVol, @(v));
     self.micLabel.text = [NSString stringWithFormat:@"Microphone Voice Volume (%.0f%%)", v];
-    ApplyMicGain();
 }
 - (void)mediaSliderChanged:(UISlider *)s {
     float v = roundf(s.value);
@@ -550,6 +546,124 @@ static void hook_viewDidDisappear(id self, SEL _cmd, BOOL animated) {
     RefreshSettingsRow();
 }
 
+#pragma mark - Microphone volume (scale what AudioUnitRender returns for the input bus)
+
+// gHookMic is declared with the other status flags above.
+static OSStatus (*orig_AudioUnitRender)(AudioUnit, AudioUnitRenderActionFlags *, const AudioTimeStamp *, UInt32, UInt32, AudioBufferList *);
+
+static void ScaleMic(AudioUnit unit, AudioBufferList *io, float g) {
+    static AudioUnit sUnit = NULL;
+    static int sKind = 0;                       // 1 = int16 PCM, 2 = float32 PCM
+    if (unit != sUnit) {
+        AudioStreamBasicDescription f; UInt32 sz = sizeof(f);
+        sKind = 0;
+        if (AudioUnitGetProperty(unit, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Output, 1, &f, &sz) == noErr
+            && f.mFormatID == kAudioFormatLinearPCM) {
+            if ((f.mFormatFlags & kAudioFormatFlagIsSignedInteger) && f.mBitsPerChannel == 16) sKind = 1;
+            else if ((f.mFormatFlags & kAudioFormatFlagIsFloat) && f.mBitsPerChannel == 32) sKind = 2;
+        }
+        sUnit = unit;
+    }
+    if (!sKind) return;
+    for (UInt32 b = 0; b < io->mNumberBuffers; b++) {
+        AudioBuffer *buf = &io->mBuffers[b];
+        if (!buf->mData) continue;
+        if (sKind == 1) {
+            int16_t *p = (int16_t *)buf->mData;
+            UInt32 n = buf->mDataByteSize / sizeof(int16_t);
+            for (UInt32 i = 0; i < n; i++) {
+                long x = lrintf((float)p[i] * g);
+                p[i] = (int16_t)(x > INT16_MAX ? INT16_MAX : (x < INT16_MIN ? INT16_MIN : x));
+            }
+        } else {
+            float *p = (float *)buf->mData;
+            UInt32 n = buf->mDataByteSize / sizeof(float);
+            for (UInt32 i = 0; i < n; i++) p[i] = fmaxf(-1.f, fminf(1.f, p[i] * g));
+        }
+    }
+}
+
+static OSStatus hook_AudioUnitRender(AudioUnit unit, AudioUnitRenderActionFlags *flags, const AudioTimeStamp *ts,
+                                     UInt32 bus, UInt32 frames, AudioBufferList *io) {
+    OSStatus st = orig_AudioUnitRender(unit, flags, ts, bus, frames, io);
+    if (st == noErr && bus == 1 && io) {                       // bus 1 = microphone input
+        float v = gMicVol.load();
+        if (fabsf(v - 100.f) >= 0.5f) ScaleMic(unit, io, v / 100.f);
+    }
+    return st;
+}
+
+// Minimal symbol rebinding (same idea as fishhook): point the app images' import of AudioUnitRender at our hook.
+static void RebindSection(struct section_64 *sect, intptr_t slide, struct nlist_64 *syms, char *strtab, uint32_t *indirect) {
+    bool isConst = strncmp(sect->segname, "__DATA_CONST", 16) == 0;
+    uint32_t *indices = indirect + sect->reserved1;
+    void **bindings = (void **)((uintptr_t)slide + sect->addr);
+    uintptr_t pg = (uintptr_t)getpagesize();
+    uintptr_t start = (uintptr_t)bindings & ~(pg - 1);
+    uintptr_t end = ((uintptr_t)bindings + sect->size + pg - 1) & ~(pg - 1);
+    bool unlocked = false;
+    for (uint32_t i = 0; i < sect->size / sizeof(void *); i++) {
+        uint32_t si = indices[i];
+        if (si == INDIRECT_SYMBOL_ABS || si == INDIRECT_SYMBOL_LOCAL || si == (INDIRECT_SYMBOL_LOCAL | INDIRECT_SYMBOL_ABS)) continue;
+        const char *name = strtab + syms[si].n_un.n_strx;
+        if (!(name[0] && name[1] && strcmp(name + 1, "AudioUnitRender") == 0)) continue;
+        if (bindings[i] == (void *)hook_AudioUnitRender) continue;
+        if (isConst && !unlocked) {
+            if (mprotect((void *)start, end - start, PROT_READ | PROT_WRITE) != 0) { LOG(@"mprotect failed"); return; }
+            unlocked = true;
+        }
+        bindings[i] = (void *)hook_AudioUnitRender;
+        gHookMic = YES;
+    }
+    if (unlocked) mprotect((void *)start, end - start, PROT_READ);
+}
+
+static void RebindImage(const struct mach_header *header, intptr_t slide) {
+    Dl_info info;
+    if (!dladdr(header, &info) || !info.dli_fname) return;
+    if (strncmp(info.dli_fname, "/System/", 8) == 0 || strncmp(info.dli_fname, "/usr/", 5) == 0) return;   // only app images
+    const struct mach_header_64 *h = (const struct mach_header_64 *)header;
+    if (h->magic != MH_MAGIC_64) return;
+    if (!orig_AudioUnitRender) {
+        orig_AudioUnitRender = (OSStatus (*)(AudioUnit, AudioUnitRenderActionFlags *, const AudioTimeStamp *, UInt32, UInt32, AudioBufferList *))dlsym(RTLD_DEFAULT, "AudioUnitRender");
+        if (!orig_AudioUnitRender) return;
+    }
+    const struct segment_command_64 *linkedit = NULL;
+    const struct symtab_command *symtab = NULL;
+    const struct dysymtab_command *dysymtab = NULL;
+    uintptr_t cur = (uintptr_t)(h + 1);
+    for (uint32_t i = 0; i < h->ncmds; i++) {
+        const struct load_command *lc = (const struct load_command *)cur;
+        if (lc->cmd == LC_SEGMENT_64) {
+            const struct segment_command_64 *seg = (const struct segment_command_64 *)cur;
+            if (strcmp(seg->segname, SEG_LINKEDIT) == 0) linkedit = seg;
+        } else if (lc->cmd == LC_SYMTAB) symtab = (const struct symtab_command *)cur;
+        else if (lc->cmd == LC_DYSYMTAB) dysymtab = (const struct dysymtab_command *)cur;
+        cur += lc->cmdsize;
+    }
+    if (!linkedit || !symtab || !dysymtab || dysymtab->nindirectsyms == 0) return;
+    uintptr_t base = (uintptr_t)slide + linkedit->vmaddr - linkedit->fileoff;
+    struct nlist_64 *syms = (struct nlist_64 *)(base + symtab->symoff);
+    char *strtab = (char *)(base + symtab->stroff);
+    uint32_t *indirect = (uint32_t *)(base + dysymtab->indirectsymoff);
+    cur = (uintptr_t)(h + 1);
+    for (uint32_t i = 0; i < h->ncmds; i++) {
+        const struct load_command *lc = (const struct load_command *)cur;
+        if (lc->cmd == LC_SEGMENT_64) {
+            const struct segment_command_64 *seg = (const struct segment_command_64 *)cur;
+            if (strcmp(seg->segname, SEG_DATA) == 0 || strcmp(seg->segname, "__DATA_CONST") == 0) {
+                struct section_64 *sects = (struct section_64 *)(cur + sizeof(struct segment_command_64));
+                for (uint32_t j = 0; j < seg->nsects; j++) {
+                    uint32_t t = sects[j].flags & SECTION_TYPE;
+                    if (t == S_LAZY_SYMBOL_POINTERS || t == S_NON_LAZY_SYMBOL_POINTERS)
+                        RebindSection(&sects[j], slide, syms, strtab, indirect);
+                }
+            }
+        }
+        cur += lc->cmdsize;
+    }
+}
+
 #pragma mark - Hook installation (idempotent, retried as images load)
 
 static BOOL HookMethod(Class c, SEL sel, IMP imp, IMP *orig) {
@@ -621,7 +735,7 @@ static void ScheduleInstall(void) {
         TryInstall();
     });
 }
-static void ImageAdded(const struct mach_header *h, intptr_t slide) { ScheduleInstall(); }
+static void ImageAdded(const struct mach_header *h, intptr_t slide) { RebindImage(h, slide); ScheduleInstall(); }
 
 __attribute__((constructor)) static void TweakInit(void) {
     LOG(@"Dynamic swizzler initializing...");
