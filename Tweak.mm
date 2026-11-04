@@ -1,6 +1,7 @@
 // TelegramCallTweak — rewritten source.
 // Behaviour reconstructed from the compiled TelegramCallTweak.dylib (original by oceanondawave):
-//   * Floating 🎧 button (drag to move, long-press 1.5s to hide) opening "Call Tweak Settings"
+//   * "Call Tweak Settings" row above the tab bar while Telegram's Settings screen is visible
+//     (fallback: small floating 🎧 button if that screen can't be hooked)
 //   * Force built-in mic (keeps Bluetooth/headphones for output only)
 //   * Share Audio Only (drops screen-share video frames, keeps the audio)
 //   * Screen media volume / microphone volume
@@ -17,6 +18,8 @@
 #import <math.h>
 
 #define LOG(fmt, ...) NSLog(@"[TelegramCallTweak] " fmt, ##__VA_ARGS__)
+
+static void ShowToastFor(NSString *text, double seconds);
 
 static NSString *const kForceMic  = @"tweak_forceBuiltInMic";
 static NSString *const kAudioOnly = @"tweak_shareAudioOnly";
@@ -48,7 +51,7 @@ static NSString *PrefsPath(void) {
 static void LoadPrefs(void) {
     NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:PrefsPath()];
     gPrefs = d ? [d mutableCopy] : [NSMutableDictionary new];
-    gForceMic  = [gPrefs[kForceMic] boolValue];
+    gForceMic  = gPrefs[kForceMic] ? [gPrefs[kForceMic] boolValue] : YES;   // on by default
     gAudioOnly = [gPrefs[kAudioOnly] boolValue];
     gMicVol    = gPrefs[kMicVol]   ? [gPrefs[kMicVol] floatValue]   : 100.f;
     gMediaVol  = gPrefs[kMediaVol] ? [gPrefs[kMediaVol] floatValue] : 100.f;
@@ -90,6 +93,15 @@ static void ApplyMicGain(void) {
     [s setInputGain:g error:nil];
 }
 
+static NSString *RouteDescription(void) {
+    AVAudioSessionRouteDescription *r = AVAudioSession.sharedInstance.currentRoute;
+    AVAudioSessionPortDescription *in = r.inputs.firstObject, *out = r.outputs.firstObject;
+    return [NSString stringWithFormat:@"Микрофон: %@ (%@)\nЗвук: %@ (%@)",
+            in.portName ?: @"—", in.portType ?: @"—", out.portName ?: @"—", out.portType ?: @"—"];
+}
+
+static NSInteger gRouteSeq = 0;
+
 @interface TweakAudioObserver : NSObject
 + (instancetype)sharedInstance;
 - (void)audioRouteChanged:(NSNotification *)n;
@@ -101,9 +113,32 @@ static void ApplyMicGain(void) {
     return o;
 }
 - (void)audioRouteChanged:(NSNotification *)n {
-    dispatch_async(dispatch_get_main_queue(), ^{ ApplyBuiltInMic(); ApplyMicGain(); });
+    dispatch_async(dispatch_get_main_queue(), ^{
+        ApplyBuiltInMic(); ApplyMicGain();
+        // Diagnostic toast while a call/recording session is active: shows where mic and sound really go.
+        NSInteger seq = ++gRouteSeq;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            if (seq != gRouteSeq) return;
+            if (![AVAudioSession.sharedInstance.category isEqualToString:AVAudioSessionCategoryPlayAndRecord]) return;
+            ShowToastFor(RouteDescription(), 5);
+        });
+    });
 }
 @end
+
+// With "force built-in mic": drop Bluetooth HFP (that's the headset's mic + mono call quality) and
+// allow A2DP so the headphones stay as the output.
+static AVAudioSessionCategoryOptions AdjustOptions(NSString *cat, AVAudioSessionCategoryOptions o) {
+    if (gForceMic && [cat isEqualToString:AVAudioSessionCategoryPlayAndRecord]) {
+        o &= ~kAllowBluetoothHFP;
+        o |= AVAudioSessionCategoryOptionAllowBluetoothA2DP;
+    }
+    return o;
+}
+
+static void AfterCategoryChange(void) {
+    dispatch_async(dispatch_get_main_queue(), ^{ ApplyBuiltInMic(); ApplyMicGain(); });
+}
 
 static AVAudioSessionCategoryOptions (*orig_categoryOptions)(id, SEL);
 static AVAudioSessionCategoryOptions hook_categoryOptions(id self, SEL _cmd) {
@@ -112,12 +147,27 @@ static AVAudioSessionCategoryOptions hook_categoryOptions(id self, SEL _cmd) {
     return o;
 }
 
+// Telegram's audio session code and WebRTC use different variants of setCategory, so cover all three.
 static BOOL (*orig_setCategory)(id, SEL, NSString *, NSString *, AVAudioSessionCategoryOptions, NSError **);
 static BOOL hook_setCategory(id self, SEL _cmd, NSString *cat, NSString *mode,
                              AVAudioSessionCategoryOptions opts, NSError **err) {
-    if (gForceMic && [cat isEqualToString:AVAudioSessionCategoryPlayAndRecord]) opts &= ~kAllowBluetoothHFP;
-    BOOL r = orig_setCategory(self, _cmd, cat, mode, opts, err);
-    if (r) dispatch_async(dispatch_get_main_queue(), ^{ ApplyBuiltInMic(); ApplyMicGain(); });
+    BOOL r = orig_setCategory(self, _cmd, cat, mode, AdjustOptions(cat, opts), err);
+    if (r) AfterCategoryChange();
+    return r;
+}
+
+static BOOL (*orig_setCategoryWithOptions)(id, SEL, NSString *, AVAudioSessionCategoryOptions, NSError **);
+static BOOL hook_setCategoryWithOptions(id self, SEL _cmd, NSString *cat, AVAudioSessionCategoryOptions opts, NSError **err) {
+    BOOL r = orig_setCategoryWithOptions(self, _cmd, cat, AdjustOptions(cat, opts), err);
+    if (r) AfterCategoryChange();
+    return r;
+}
+
+static BOOL (*orig_setCategoryRSP)(id, SEL, NSString *, NSString *, NSUInteger, AVAudioSessionCategoryOptions, NSError **);
+static BOOL hook_setCategoryRSP(id self, SEL _cmd, NSString *cat, NSString *mode, NSUInteger policy,
+                                AVAudioSessionCategoryOptions opts, NSError **err) {
+    BOOL r = orig_setCategoryRSP(self, _cmd, cat, mode, policy, AdjustOptions(cat, opts), err);
+    if (r) AfterCategoryChange();
     return r;
 }
 
@@ -151,31 +201,14 @@ static void hook_submitSampleBuffer(id self, SEL _cmd, CMSampleBufferRef sb, NSI
 
 #pragma mark - Settings UI
 
-static BOOL gHookAudio = NO, gHookVideo = NO, gHookSession = NO;
-static BOOL gSettingsOpen = NO;
-
-static UIWindow *ActiveWindow(void) {
-    UIWindow *fallback = nil;
-    for (UIScene *sc in UIApplication.sharedApplication.connectedScenes) {
-        if (![sc isKindOfClass:UIWindowScene.class]) continue;
-        if (sc.activationState != UISceneActivationStateForegroundActive) continue;
-        for (UIWindow *x in ((UIWindowScene *)sc).windows) {
-            if (x.isKeyWindow) return x;
-            if (!fallback && !x.isHidden && x.windowLevel == UIWindowLevelNormal) fallback = x;
-        }
-    }
-    return fallback;
-}
-
-static UIViewController *TopViewController(void) {
-    UIViewController *v = ActiveWindow().rootViewController;
-    while (v.presentedViewController) v = v.presentedViewController;
-    return v;
-}
+static BOOL gHookAudio = NO, gHookVideo = NO, gHookSession = NO, gHookSettings = NO;
+static BOOL gRowWanted = NO;                       // a profile/settings screen is on screen
+static NSHashTable *gVisibleProfiles;              // weak: visible PeerInfoScreenImpl instances
+static void RefreshSettingsRow(void);
 
 static NSString *HookStatus(void) {
-    return [NSString stringWithFormat:@"Hooks: звук экрана %@ · видео %@ · аудиосессия %@",
-            gHookAudio ? @"✓" : @"✗", gHookVideo ? @"✓" : @"✗", gHookSession ? @"✓" : @"✗"];
+    return [NSString stringWithFormat:@"Hooks: звук экрана %@ · видео %@ · аудиосессия %@ · экран настроек %@",
+            gHookAudio ? @"✓" : @"✗", gHookVideo ? @"✓" : @"✗", gHookSession ? @"✓" : @"✗", gHookSettings ? @"✓" : @"✗"];
 }
 
 @interface TweakSettingsViewController : UIViewController <UITableViewDataSource, UITableViewDelegate>
@@ -206,7 +239,6 @@ static NSString *HookStatus(void) {
 - (NSInteger)tableView:(UITableView *)tv numberOfRowsInSection:(NSInteger)s { return s == 0 ? 2 : 3; }
 - (NSString *)tableView:(UITableView *)tv titleForHeaderInSection:(NSInteger)s { return s == 0 ? @"Preferences" : @"Volume Levels"; }
 - (NSString *)tableView:(UITableView *)tv titleForFooterInSection:(NSInteger)s { return s == 1 ? HookStatus() : nil; }
-- (void)viewDidDisappear:(BOOL)animated { [super viewDidDisappear:animated]; gSettingsOpen = NO; }
 - (CGFloat)tableView:(UITableView *)tv heightForRowAtIndexPath:(NSIndexPath *)ip { return (ip.section == 1 && ip.row < 2) ? 68 : 48; }
 
 - (UITableViewCell *)tableView:(UITableView *)tv cellForRowAtIndexPath:(NSIndexPath *)ip {
@@ -297,17 +329,70 @@ static NSString *HookStatus(void) {
 }
 @end
 
+#pragma mark - Own overlay window (independent of Telegram's window / touch handling)
+
+static void ShowToast(NSString *text);
+
+// Passes every touch that doesn't hit one of our views through to Telegram underneath.
+@interface TweakPassthroughWindow : UIWindow
+@end
+@implementation TweakPassthroughWindow
+- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
+    UIView *v = [super hitTest:point withEvent:event];
+    if (v == self || v == self.rootViewController.view) return nil;
+    return v;
+}
+@end
+
+@interface TweakHostViewController : UIViewController
+@end
+@implementation TweakHostViewController
+- (void)loadView {
+    UIView *v = [UIView new];
+    v.backgroundColor = UIColor.clearColor;
+    self.view = v;
+}
+@end
+
+static TweakPassthroughWindow *gTweakWindow;
+static TweakHostViewController *gHostVC;
+
+static UIWindowScene *ActiveScene(void) {
+    for (UIScene *sc in UIApplication.sharedApplication.connectedScenes)
+        if ([sc isKindOfClass:UIWindowScene.class] && sc.activationState == UISceneActivationStateForegroundActive)
+            return (UIWindowScene *)sc;
+    return nil;
+}
+
+static void EnsureTweakWindow(void) {
+    UIWindowScene *sc = ActiveScene();
+    if (!sc) return;
+    if (gTweakWindow && gTweakWindow.windowScene != sc) {
+        gTweakWindow.hidden = YES;
+        gTweakWindow = nil;
+        gHostVC = nil;
+    }
+    if (gTweakWindow) { gTweakWindow.hidden = NO; return; }
+    gTweakWindow = [[TweakPassthroughWindow alloc] initWithWindowScene:sc];
+    gTweakWindow.windowLevel = UIWindowLevelAlert + 100;
+    gTweakWindow.backgroundColor = UIColor.clearColor;
+    gHostVC = [TweakHostViewController new];
+    gTweakWindow.rootViewController = gHostVC;
+    gTweakWindow.hidden = NO;
+}
+
 @interface TweakActions : NSObject
 + (void)openCallTweakSettingsModally;
 @end
 @implementation TweakActions
 + (void)openCallTweakSettingsModally {
-    if (gSettingsOpen) return;
-    gSettingsOpen = YES;
+    EnsureTweakWindow();
+    if (!gHostVC) { ShowToast(@"Окно твика недоступно, попробуйте ещё раз"); return; }
+    if (gHostVC.presentedViewController) return;
     TweakSettingsViewController *vc = [TweakSettingsViewController new];
     UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:vc];
     nav.modalPresentationStyle = UIModalPresentationPageSheet;
-    [TopViewController() presentViewController:nav animated:YES completion:nil];
+    [gHostVC presentViewController:nav animated:YES completion:nil];
 }
 @end
 
@@ -315,37 +400,86 @@ static NSString *HookStatus(void) {
 
 static BOOL gFloatHidden = NO;
 
+// Row sizing (pinned above the tab bar). Tweak these if it overlaps something.
+#define ROW_HEIGHT      50.0
+#define ROW_SIDE_MARGIN 16.0
+#define ROW_BOTTOM_GAP  (49.0 + 12.0)     // tab bar + margin
+
 @interface TweakFloat : NSObject
 + (instancetype)shared;
 - (void)ensure;
 @end
 @implementation TweakFloat {
-    UIButton *_btn;
+    UIButton *_row;      // list-style row, shown only while Telegram's Settings screen is visible
+    UIButton *_btn;      // fallback floating button, used only when the Settings hook isn't installed
 }
 + (instancetype)shared {
     static TweakFloat *f; static dispatch_once_t t;
     dispatch_once(&t, ^{ f = [TweakFloat new]; });
     return f;
 }
+- (void)buildRow {
+    _row = [UIButton buttonWithType:UIButtonTypeCustom];
+    _row.backgroundColor = UIColor.secondarySystemGroupedBackgroundColor;
+    _row.layer.cornerRadius = 12;
+    _row.layer.borderWidth = 0.5;
+    _row.layer.borderColor = UIColor.separatorColor.CGColor;
+    [_row setTitle:@"🎧  Call Tweak Settings" forState:UIControlStateNormal];
+    [_row setTitleColor:UIColor.labelColor forState:UIControlStateNormal];
+    _row.titleLabel.font = [UIFont systemFontOfSize:17];
+    _row.contentHorizontalAlignment = UIControlContentHorizontalAlignmentLeft;
+    _row.contentEdgeInsets = UIEdgeInsetsMake(0, 16, 0, 40);
+    UIImageView *chev = [[UIImageView alloc] initWithImage:[UIImage systemImageNamed:@"chevron.right"]];
+    chev.tintColor = UIColor.tertiaryLabelColor;
+    chev.contentMode = UIViewContentModeScaleAspectFit;
+    chev.tag = 0x7042;
+    chev.userInteractionEnabled = NO;
+    [_row addSubview:chev];
+    [_row addTarget:self action:@selector(tap) forControlEvents:UIControlEventTouchUpInside];
+}
+- (void)buildFloat {
+    CGRect wb = gTweakWindow.bounds;
+    _btn = [UIButton buttonWithType:UIButtonTypeCustom];
+    _btn.frame = CGRectMake(wb.size.width - 60, gTweakWindow.safeAreaInsets.top + 110, 48, 48);
+    _btn.backgroundColor = [[UIColor systemBlueColor] colorWithAlphaComponent:0.85];
+    _btn.layer.cornerRadius = 24;
+    [_btn setTitle:@"🎧" forState:UIControlStateNormal];
+    _btn.titleLabel.font = [UIFont systemFontOfSize:24];
+    [_btn addTarget:self action:@selector(tap) forControlEvents:UIControlEventTouchUpInside];
+    [_btn addGestureRecognizer:[[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(pan:)]];
+    UILongPressGestureRecognizer *lp = [[UILongPressGestureRecognizer alloc] initWithTarget:self action:@selector(hide:)];
+    lp.minimumPressDuration = 1.5;
+    [_btn addGestureRecognizer:lp];
+}
 - (void)ensure {
-    if (gFloatHidden) return;
-    UIWindow *w = ActiveWindow();
-    if (!w) return;
-    if (!_btn) {
-        _btn = [UIButton buttonWithType:UIButtonTypeCustom];
-        _btn.frame = CGRectMake(w.bounds.size.width - 54, w.safeAreaInsets.top + 110, 44, 44);
-        _btn.backgroundColor = [[UIColor systemBlueColor] colorWithAlphaComponent:0.78];
-        _btn.layer.cornerRadius = 22;
-        [_btn setTitle:@"🎧" forState:UIControlStateNormal];
-        _btn.titleLabel.font = [UIFont systemFontOfSize:22];
-        [_btn addTarget:self action:@selector(tap) forControlEvents:UIControlEventTouchUpInside];
-        [_btn addGestureRecognizer:[[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(pan:)]];
-        UILongPressGestureRecognizer *lp = [[UILongPressGestureRecognizer alloc] initWithTarget:self action:@selector(hide:)];
-        lp.minimumPressDuration = 1.5;
-        [_btn addGestureRecognizer:lp];
+    EnsureTweakWindow();
+    if (!gHostVC) return;
+    UIView *host = gHostVC.view;
+    CGRect wb = gTweakWindow.bounds;
+
+    // 1) Settings row (preferred)
+    BOOL showRow = gHookSettings && gRowWanted;
+    if (!_row) [self buildRow];
+    if (_row.superview != host) [host addSubview:_row];
+    _row.hidden = !showRow;
+    if (showRow) {
+        CGFloat w = wb.size.width - 2 * ROW_SIDE_MARGIN;
+        CGFloat y = wb.size.height - gTweakWindow.safeAreaInsets.bottom - ROW_BOTTOM_GAP - ROW_HEIGHT;
+        _row.frame = CGRectMake(ROW_SIDE_MARGIN, y, w, ROW_HEIGHT);
+        UIView *chev = [_row viewWithTag:0x7042];
+        chev.frame = CGRectMake(w - 32, (ROW_HEIGHT - 18) / 2, 12, 18);
+        [host bringSubviewToFront:_row];
     }
-    if (_btn.superview != w) { [_btn removeFromSuperview]; [w addSubview:_btn]; }
-    [w bringSubviewToFront:_btn];
+
+    // 2) Fallback floating button, only if we couldn't hook the Settings screen at all
+    BOOL showFloat = !gHookSettings && !gFloatHidden;
+    if (showFloat) {
+        if (!_btn) [self buildFloat];
+        if (_btn.superview != host) [host addSubview:_btn];
+        [host bringSubviewToFront:_btn];
+    } else if (_btn) {
+        [_btn removeFromSuperview];
+    }
 }
 - (void)tap { [TweakActions openCallTweakSettingsModally]; }
 - (void)pan:(UIPanGestureRecognizer *)g {
@@ -360,10 +494,20 @@ static BOOL gFloatHidden = NO;
 }
 @end
 
-static void ShowToast(NSString *text) {
-    UIWindow *w = ActiveWindow();
-    if (!w) return;
+static void RefreshSettingsRow(void) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        gRowWanted = gVisibleProfiles.count > 0;
+        [[TweakFloat shared] ensure];
+    });
+}
+
+static void ShowToastFor(NSString *text, double seconds) {
+    EnsureTweakWindow();
+    UIView *host = gHostVC.view;
+    if (!host) return;
+    [[host viewWithTag:0x7041] removeFromSuperview];       // only one toast at a time
     UILabel *l = [UILabel new];
+    l.tag = 0x7041;
     l.numberOfLines = 0;
     l.text = text;
     l.font = [UIFont systemFontOfSize:12 weight:UIFontWeightMedium];
@@ -372,20 +516,38 @@ static void ShowToast(NSString *text) {
     l.backgroundColor = [UIColor.blackColor colorWithAlphaComponent:0.82];
     l.layer.cornerRadius = 10;
     l.clipsToBounds = YES;
-    CGFloat maxW = w.bounds.size.width - 40;
-    CGSize s = [l sizeThatFits:CGSizeMake(maxW - 20, CGFLOAT_MAX)];
-    l.frame = CGRectMake(20, w.safeAreaInsets.top + 8, maxW, s.height + 16);
-    [w addSubview:l];
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 7 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+    CGFloat maxW = gTweakWindow.bounds.size.width - 40;
+    CGSize sz = [l sizeThatFits:CGSizeMake(maxW - 20, CGFLOAT_MAX)];
+    l.frame = CGRectMake(20, gTweakWindow.safeAreaInsets.top + 8, maxW, sz.height + 16);
+    l.userInteractionEnabled = NO;
+    [host addSubview:l];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(seconds * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         [UIView animateWithDuration:0.3 animations:^{ l.alpha = 0; } completion:^(BOOL f) { [l removeFromSuperview]; }];
     });
 }
 
+static void ShowToast(NSString *text) { ShowToastFor(text, 7); }
+
 static void ScheduleToast(int tries) {
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
-        if (!ActiveWindow() && tries > 0) { ScheduleToast(tries - 1); return; }
+        if (!ActiveScene() && tries > 0) { ScheduleToast(tries - 1); return; }
         ShowToast([@"TelegramCallTweak загружен\n" stringByAppendingString:HookStatus()]);
     });
+}
+
+#pragma mark - Settings screen hooks (show the row while PeerInfoScreenImpl is visible)
+
+static void (*orig_viewDidAppear)(id, SEL, BOOL);
+static void hook_viewDidAppear(id self, SEL _cmd, BOOL animated) {
+    orig_viewDidAppear(self, _cmd, animated);
+    [gVisibleProfiles addObject:self];
+    RefreshSettingsRow();
+}
+static void (*orig_viewDidDisappear)(id, SEL, BOOL);
+static void hook_viewDidDisappear(id self, SEL _cmd, BOOL animated) {
+    orig_viewDidDisappear(self, _cmd, animated);
+    [gVisibleProfiles removeObject:self];
+    RefreshSettingsRow();
 }
 
 #pragma mark - Hook installation (idempotent, retried as images load)
@@ -432,11 +594,21 @@ static void TryInstall(void) {
                 gHookVideo = YES; LOG(@"Hooked %s submitSampleBuffer", class_getName(c));
             }
         }
+        if (!gHookSettings) {
+            Class c = FindClass("PeerInfoScreenImpl");
+            if (c) {
+                BOOL a = HookMethod(c, @selector(viewDidAppear:), (IMP)hook_viewDidAppear, (IMP *)&orig_viewDidAppear);
+                BOOL b = HookMethod(c, @selector(viewDidDisappear:), (IMP)hook_viewDidDisappear, (IMP *)&orig_viewDidDisappear);
+                if (a && b) { gHookSettings = YES; LOG(@"Hooked %s appear/disappear", class_getName(c)); }
+            }
+        }
         if (!gHookSession) {
             Class c = [AVAudioSession class];
             BOOL a = HookMethod(c, @selector(categoryOptions), (IMP)hook_categoryOptions, (IMP *)&orig_categoryOptions);
             BOOL b = HookMethod(c, @selector(setCategory:mode:options:error:), (IMP)hook_setCategory, (IMP *)&orig_setCategory);
-            if (a && b) { gHookSession = YES; LOG(@"Hooked AVAudioSession"); }
+            BOOL d = HookMethod(c, @selector(setCategory:withOptions:error:), (IMP)hook_setCategoryWithOptions, (IMP *)&orig_setCategoryWithOptions);
+            BOOL e = HookMethod(c, @selector(setCategory:mode:routeSharingPolicy:options:error:), (IMP)hook_setCategoryRSP, (IMP *)&orig_setCategoryRSP);
+            if (a || b || d || e) { gHookSession = YES; LOG(@"Hooked AVAudioSession (%d %d %d %d)", a, b, d, e); }
         }
     }
 }
@@ -454,6 +626,7 @@ static void ImageAdded(const struct mach_header *h, intptr_t slide) { ScheduleIn
 __attribute__((constructor)) static void TweakInit(void) {
     LOG(@"Dynamic swizzler initializing...");
     LoadPrefs();
+    gVisibleProfiles = [NSHashTable weakObjectsHashTable];
     [[NSNotificationCenter defaultCenter] addObserver:[TweakAudioObserver sharedInstance]
                                              selector:@selector(audioRouteChanged:)
                                                  name:AVAudioSessionRouteChangeNotification
