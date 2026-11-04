@@ -31,6 +31,7 @@ static NSString *const kForceMic  = @"tweak_forceBuiltInMic";
 static NSString *const kAudioOnly = @"tweak_shareAudioOnly";
 static NSString *const kMicVol    = @"tweak_micVolume";
 static NSString *const kMediaVol  = @"tweak_mediaVolume";
+static NSString *const kRawMic    = @"tweak_rawMic";
 
 // AVAudioSessionCategoryOptionAllowBluetooth (renamed ...HFP in iOS 26, same value)
 static const NSUInteger kAllowBluetoothHFP = 0x4;
@@ -41,6 +42,11 @@ static std::atomic<bool>  gForceMic{false};
 static std::atomic<bool>  gAudioOnly{false};
 static std::atomic<float> gMicVol{100.f};
 static std::atomic<float> gMediaVol{100.f};
+static std::atomic<bool>  gRawMic{false};            // bypass iOS voice processing on the mic (use only with headphones)
+static std::atomic<AudioUnit> gMicUnit{NULL};        // mic unit whose sample format is known
+static std::atomic<int>       gMicKind{0};           // 1 = int16 PCM, 2 = float32 PCM, 0 = unknown/unsupported
+static std::atomic<AudioUnit> gPendingUnit{NULL};    // seen in the render callback, format not queried yet
+static std::atomic<float>     gPeakIn{0.f}, gPeakOut{0.f};   // mic peak before / after our gain (0..1), for the meter
 static NSMutableDictionary *gPrefs;
 
 static NSString *PrefsPath(void) {
@@ -61,6 +67,7 @@ static void LoadPrefs(void) {
     gAudioOnly = [gPrefs[kAudioOnly] boolValue];
     gMicVol    = gPrefs[kMicVol]   ? [gPrefs[kMicVol] floatValue]   : 100.f;
     gMediaVol  = gPrefs[kMediaVol] ? [gPrefs[kMediaVol] floatValue] : 100.f;
+    gRawMic    = [gPrefs[kRawMic] boolValue];
 }
 
 static void SavePref(NSString *key, id value) {
@@ -215,7 +222,9 @@ static NSString *HookStatus(void) {
 @property (nonatomic, strong) UITableView *tableView;
 @property (nonatomic, strong) UILabel *micLabel, *mediaLabel;
 @property (nonatomic, strong) UISlider *micSlider, *mediaSlider;
-@property (nonatomic, strong) UISwitch *forceMicSwitch, *audioOnlySwitch;
+@property (nonatomic, strong) UISwitch *forceMicSwitch, *audioOnlySwitch, *rawMicSwitch;
+@property (nonatomic, strong) UILabel *meterLabel;
+@property (nonatomic, strong) NSTimer *meterTimer;
 @end
 
 @implementation TweakSettingsViewController
@@ -235,11 +244,11 @@ static NSString *HookStatus(void) {
 
 - (void)dismissSelf { [self dismissViewControllerAnimated:YES completion:nil]; }
 
-- (NSInteger)numberOfSectionsInTableView:(UITableView *)tv { return 2; }
-- (NSInteger)tableView:(UITableView *)tv numberOfRowsInSection:(NSInteger)s { return s == 0 ? 2 : 3; }
-- (NSString *)tableView:(UITableView *)tv titleForHeaderInSection:(NSInteger)s { return s == 0 ? @"Preferences" : @"Volume Levels"; }
+- (NSInteger)numberOfSectionsInTableView:(UITableView *)tv { return 3; }
+- (NSInteger)tableView:(UITableView *)tv numberOfRowsInSection:(NSInteger)s { return s == 0 ? 3 : (s == 1 ? 3 : 1); }
+- (NSString *)tableView:(UITableView *)tv titleForHeaderInSection:(NSInteger)s { return s == 0 ? @"Preferences" : (s == 1 ? @"Volume Levels" : @"Диагностика микрофона"); }
 - (NSString *)tableView:(UITableView *)tv titleForFooterInSection:(NSInteger)s { return s == 1 ? HookStatus() : nil; }
-- (CGFloat)tableView:(UITableView *)tv heightForRowAtIndexPath:(NSIndexPath *)ip { return (ip.section == 1 && ip.row < 2) ? 68 : 48; }
+- (CGFloat)tableView:(UITableView *)tv heightForRowAtIndexPath:(NSIndexPath *)ip { return (ip.section == 1 && ip.row < 2) ? 68 : (ip.section == 2 ? 84 : 48); }
 
 - (UITableViewCell *)tableView:(UITableView *)tv cellForRowAtIndexPath:(NSIndexPath *)ip {
     UITableViewCell *c = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:nil];
@@ -251,6 +260,12 @@ static NSString *HookStatus(void) {
             [sw setOn:gForceMic animated:NO];
             [sw addTarget:self action:@selector(forceMicToggled:) forControlEvents:UIControlEventValueChanged];
             self.forceMicSwitch = sw;
+        } else if (ip.row == 2) {
+            c.textLabel.text = @"Raw Mic (no voice processing)";
+            c.textLabel.adjustsFontSizeToFitWidth = YES;
+            [sw setOn:gRawMic.load() animated:NO];
+            [sw addTarget:self action:@selector(rawMicToggled:) forControlEvents:UIControlEventValueChanged];
+            self.rawMicSwitch = sw;
         } else {
             c.textLabel.text = @"Share Audio Only";
             [sw setOn:gAudioOnly animated:NO];
@@ -260,6 +275,13 @@ static NSString *HookStatus(void) {
         c.accessoryView = sw;
         return c;
     }
+    if (ip.section == 2) {
+        c.textLabel.numberOfLines = 0;
+        c.textLabel.font = [UIFont monospacedDigitSystemFontOfSize:13 weight:UIFontWeightRegular];
+        c.textLabel.text = @"Откройте это окно во время звонка и говорите: здесь появится уровень микрофона.";
+        self.meterLabel = c.textLabel;
+        return c;
+    }
     if (ip.row < 2) {
         BOOL mic = (ip.row == 0);
         UILabel *l = [UILabel new];
@@ -267,7 +289,7 @@ static NSString *HookStatus(void) {
         l.translatesAutoresizingMaskIntoConstraints = NO;
         UISlider *s = [UISlider new];
         s.minimumValue = 0;
-        s.maximumValue = mic ? 300 : 200;
+        s.maximumValue = mic ? 800 : 200;
         s.translatesAutoresizingMaskIntoConstraints = NO;
         float v = mic ? gMicVol.load() : gMediaVol.load();
         [s setValue:v animated:NO];
@@ -310,6 +332,30 @@ static NSString *HookStatus(void) {
     gForceMic = sw.isOn;
     SavePref(kForceMic, @(sw.isOn));
     ApplyBuiltInMic();
+}
+- (void)rawMicToggled:(UISwitch *)sw {
+    gRawMic = sw.isOn;
+    SavePref(kRawMic, @(sw.isOn));
+    EnableMicHook();            // we need the mic unit pointer, which the hook supplies
+}
+- (void)viewDidAppear:(BOOL)animated {
+    [super viewDidAppear:animated];
+    EnableMicHook();            // so the meter has data even at 100%
+    __weak typeof(self) ws = self;
+    self.meterTimer = [NSTimer scheduledTimerWithTimeInterval:0.4 repeats:YES block:^(NSTimer *t) { [ws updateMeter]; }];
+}
+- (void)viewDidDisappear:(BOOL)animated {
+    [super viewDidDisappear:animated];
+    [self.meterTimer invalidate];
+    self.meterTimer = nil;
+}
+- (void)updateMeter {
+    float pi = gPeakIn.exchange(0.f), po = gPeakOut.exchange(0.f);
+    int kind = gMicKind.load();
+    NSString *fmt = kind == 1 ? @"int16" : (kind == 2 ? @"float32" : (gMicUnit.load() ? @"не поддерживается" : @"ждём звонок"));
+    NSString *a = pi > 0.00003f ? [NSString stringWithFormat:@"%.0f дБ", 20.f * log10f(pi)] : @"тишина";
+    NSString *b = po > 0.00003f ? [NSString stringWithFormat:@"%.0f дБ", 20.f * log10f(po)] : @"тишина";
+    self.meterLabel.text = [NSString stringWithFormat:@"Пик на входе: %@\nПосле усиления: %@\nХук: %@ · формат: %@", a, b, gHookMic ? @"✓" : @"✗", fmt];
 }
 - (void)audioOnlyToggled:(UISwitch *)sw {
     gAudioOnly = sw.isOn;
@@ -554,15 +600,27 @@ static void hook_viewDidDisappear(id self, SEL _cmd, BOOL animated) {
 // gHookMic is declared with the other status flags above.
 static OSStatus (*orig_AudioUnitRender)(AudioUnit, AudioUnitRenderActionFlags *, const AudioTimeStamp *, UInt32, UInt32, AudioBufferList *);
 
-static std::atomic<AudioUnit> gMicUnit{NULL};        // unit whose sample format is known
-static std::atomic<int>       gMicKind{0};           // 1 = int16 PCM, 2 = float32 PCM, 0 = unknown/unsupported
-static std::atomic<AudioUnit> gPendingUnit{NULL};    // seen in the render callback, format not queried yet
+// Raw mic: switch off iOS voice processing (AEC/noise suppression) on the mic unit. With headphones
+// as output there's no echo to cancel, and the processing is what often makes the voice very quiet.
+static void ApplyRawMic(AudioUnit u) {
+    static AudioUnit lastU = NULL;
+    static int lastVal = -1;
+    int want = gRawMic.load() ? 1 : 0;
+    if (!want && lastVal != 1) return;                 // never touch the default behaviour unless asked
+    if (u == lastU && want == lastVal) return;
+    UInt32 v = (UInt32)want;
+    OSStatus st = AudioUnitSetProperty(u, kAUVoiceIOProperty_BypassVoiceProcessing, kAudioUnitScope_Global, 0, &v, sizeof(v));
+    LOG(@"BypassVoiceProcessing=%d -> status %d", want, (int)st);
+    lastU = u; lastVal = want;
+}
 
-// Runs on the main thread (timer). Never query CoreAudio from inside the render callback:
+// Runs on the main thread (timer). Never call into CoreAudio from inside the render callback:
 // that thread serves both microphone and speaker, and blocking it silences the whole call.
 static void ResolveMicFormat(void) {
     AudioUnit u = gPendingUnit.load();
-    if (!u || u == gMicUnit.load()) return;
+    if (!u) return;
+    ApplyRawMic(u);
+    if (u == gMicUnit.load()) return;
     AudioStreamBasicDescription f; UInt32 sz = sizeof(f);
     int kind = 0;
     if (AudioUnitGetProperty(u, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Output, 1, &f, &sz) == noErr
@@ -574,11 +632,13 @@ static void ResolveMicFormat(void) {
     gMicUnit.store(u);
 }
 
-// Real-time safe: only atomics and arithmetic.
+// Real-time safe: only atomics and arithmetic. Also measures the peak level for the diagnostics meter.
 static void ScaleMic(AudioUnit unit, AudioBufferList *io, float g) {
     if (unit != gMicUnit.load()) { gPendingUnit.store(unit); return; }   // format not known yet: pass through
     int kind = gMicKind.load();
     if (!kind) return;
+    bool apply = fabsf(g - 1.f) >= 0.005f;
+    float pin = 0.f, pout = 0.f;
     for (UInt32 b = 0; b < io->mNumberBuffers; b++) {
         AudioBuffer *buf = &io->mBuffers[b];
         if (!buf->mData) continue;
@@ -586,23 +646,38 @@ static void ScaleMic(AudioUnit unit, AudioBufferList *io, float g) {
             int16_t *p = (int16_t *)buf->mData;
             UInt32 n = buf->mDataByteSize / sizeof(int16_t);
             for (UInt32 i = 0; i < n; i++) {
-                long x = lrintf((float)p[i] * g);
-                p[i] = (int16_t)(x > INT16_MAX ? INT16_MAX : (x < INT16_MIN ? INT16_MIN : x));
+                int x = p[i];
+                float a = (float)abs(x) / 32768.f;
+                if (a > pin) pin = a;
+                if (apply) {
+                    long y = lrintf((float)x * g);
+                    y = y > INT16_MAX ? INT16_MAX : (y < INT16_MIN ? INT16_MIN : y);
+                    p[i] = (int16_t)y;
+                    a = (float)labs(y) / 32768.f;
+                }
+                if (a > pout) pout = a;
             }
         } else {
             float *p = (float *)buf->mData;
             UInt32 n = buf->mDataByteSize / sizeof(float);
-            for (UInt32 i = 0; i < n; i++) p[i] = fmaxf(-1.f, fminf(1.f, p[i] * g));
+            for (UInt32 i = 0; i < n; i++) {
+                float x = p[i];
+                float a = fabsf(x);
+                if (a > pin) pin = a;
+                if (apply) { x = fmaxf(-1.f, fminf(1.f, x * g)); p[i] = x; a = fabsf(x); }
+                if (a > pout) pout = a;
+            }
         }
     }
+    if (pin > gPeakIn.load()) gPeakIn.store(pin);
+    if (pout > gPeakOut.load()) gPeakOut.store(pout);
 }
 
 static OSStatus hook_AudioUnitRender(AudioUnit unit, AudioUnitRenderActionFlags *flags, const AudioTimeStamp *ts,
                                      UInt32 bus, UInt32 frames, AudioBufferList *io) {
     OSStatus st = orig_AudioUnitRender(unit, flags, ts, bus, frames, io);
     if (st == noErr && bus == 1 && io) {                       // bus 1 = microphone input
-        float v = gMicVol.load();
-        if (fabsf(v - 100.f) >= 0.5f) ScaleMic(unit, io, v / 100.f);
+        ScaleMic(unit, io, gMicVol.load() / 100.f);
     }
     return st;
 }
@@ -772,7 +847,7 @@ __attribute__((constructor)) static void TweakInit(void) {
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 4 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{ TryInstall(); });
     dispatch_async(dispatch_get_main_queue(), ^{
         [NSTimer scheduledTimerWithTimeInterval:2.0 repeats:YES block:^(NSTimer *t) { [[TweakFloat shared] ensure]; ResolveMicFormat(); }];
-        if (fabsf(gMicVol.load() - 100.f) >= 0.5f) EnableMicHook();
+        if (fabsf(gMicVol.load() - 100.f) >= 0.5f || gRawMic.load()) EnableMicHook();
         ScheduleToast(10);
     });
 }
