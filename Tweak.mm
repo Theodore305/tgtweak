@@ -1,6 +1,6 @@
 // TelegramCallTweak — rewritten source.
 // Behaviour reconstructed from the compiled TelegramCallTweak.dylib (original by oceanondawave):
-//   * "Call Tweak Settings" entry on the Telegram Settings screen
+//   * Floating 🎧 button (drag to move, long-press 1.5s to hide) opening "Call Tweak Settings"
 //   * Force built-in mic (keeps Bluetooth/headphones for output only)
 //   * Share Audio Only (drops screen-share video frames, keeps the audio)
 //   * Screen media volume / microphone volume
@@ -17,12 +17,6 @@
 #import <math.h>
 
 #define LOG(fmt, ...) NSLog(@"[TelegramCallTweak] " fmt, ##__VA_ARGS__)
-
-// ---- layout of the floating button on the Settings screen (adjust if it overlaps) ----
-#define BTN_WIDTH        200.0
-#define BTN_HEIGHT       34.0
-#define BTN_BOTTOM_GAP   (49.0 + 16.0)   // tab bar + margin
-#define BTN_TAG          0xCA11
 
 static NSString *const kForceMic  = @"tweak_forceBuiltInMic";
 static NSString *const kAudioOnly = @"tweak_shareAudioOnly";
@@ -157,16 +151,31 @@ static void hook_submitSampleBuffer(id self, SEL _cmd, CMSampleBufferRef sb, NSI
 
 #pragma mark - Settings UI
 
-static UIViewController *TopViewController(void) {
-    UIWindow *w = nil;
+static BOOL gHookAudio = NO, gHookVideo = NO, gHookSession = NO;
+static BOOL gSettingsOpen = NO;
+
+static UIWindow *ActiveWindow(void) {
+    UIWindow *fallback = nil;
     for (UIScene *sc in UIApplication.sharedApplication.connectedScenes) {
         if (![sc isKindOfClass:UIWindowScene.class]) continue;
-        for (UIWindow *x in ((UIWindowScene *)sc).windows) if (x.isKeyWindow) { w = x; break; }
-        if (w) break;
+        if (sc.activationState != UISceneActivationStateForegroundActive) continue;
+        for (UIWindow *x in ((UIWindowScene *)sc).windows) {
+            if (x.isKeyWindow) return x;
+            if (!fallback && !x.isHidden && x.windowLevel == UIWindowLevelNormal) fallback = x;
+        }
     }
-    UIViewController *v = w.rootViewController;
+    return fallback;
+}
+
+static UIViewController *TopViewController(void) {
+    UIViewController *v = ActiveWindow().rootViewController;
     while (v.presentedViewController) v = v.presentedViewController;
     return v;
+}
+
+static NSString *HookStatus(void) {
+    return [NSString stringWithFormat:@"Hooks: звук экрана %@ · видео %@ · аудиосессия %@",
+            gHookAudio ? @"✓" : @"✗", gHookVideo ? @"✓" : @"✗", gHookSession ? @"✓" : @"✗"];
 }
 
 @interface TweakSettingsViewController : UIViewController <UITableViewDataSource, UITableViewDelegate>
@@ -196,6 +205,8 @@ static UIViewController *TopViewController(void) {
 - (NSInteger)numberOfSectionsInTableView:(UITableView *)tv { return 2; }
 - (NSInteger)tableView:(UITableView *)tv numberOfRowsInSection:(NSInteger)s { return s == 0 ? 2 : 3; }
 - (NSString *)tableView:(UITableView *)tv titleForHeaderInSection:(NSInteger)s { return s == 0 ? @"Preferences" : @"Volume Levels"; }
+- (NSString *)tableView:(UITableView *)tv titleForFooterInSection:(NSInteger)s { return s == 1 ? HookStatus() : nil; }
+- (void)viewDidDisappear:(BOOL)animated { [super viewDidDisappear:animated]; gSettingsOpen = NO; }
 - (CGFloat)tableView:(UITableView *)tv heightForRowAtIndexPath:(NSIndexPath *)ip { return (ip.section == 1 && ip.row < 2) ? 68 : 48; }
 
 - (UITableViewCell *)tableView:(UITableView *)tv cellForRowAtIndexPath:(NSIndexPath *)ip {
@@ -291,6 +302,8 @@ static UIViewController *TopViewController(void) {
 @end
 @implementation TweakActions
 + (void)openCallTweakSettingsModally {
+    if (gSettingsOpen) return;
+    gSettingsOpen = YES;
     TweakSettingsViewController *vc = [TweakSettingsViewController new];
     UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:vc];
     nav.modalPresentationStyle = UIModalPresentationPageSheet;
@@ -298,37 +311,81 @@ static UIViewController *TopViewController(void) {
 }
 @end
 
-// Adds the "Call Tweak Settings" button to the root Settings screen (PeerInfoScreenImpl).
-static void (*orig_viewDidLayoutSubviews)(id, SEL);
-static void hook_viewDidLayoutSubviews(UIViewController *self, SEL _cmd) {
-    orig_viewDidLayoutSubviews(self, _cmd);
+#pragma mark - Floating button + load toast (independent of Telegram's own screens)
 
-    if (!strstr(class_getName(object_getClass(self)), "PeerInfoScreenImpl")) return;
-    UIViewController *nav = self.navigationController;
-    if (!nav || ![nav respondsToSelector:@selector(viewControllers)]) return;
-    NSArray *stack = [nav performSelector:@selector(viewControllers)];
-    if (stack.firstObject != self) return;            // only the Settings tab root, not pushed profiles
+static BOOL gFloatHidden = NO;
 
-    UIView *host = self.view;
-    UIButton *b = (UIButton *)[host viewWithTag:BTN_TAG];
-    if (!b) {
-        b = [UIButton buttonWithType:UIButtonTypeSystem];
-        b.tag = BTN_TAG;
-        [b setTitle:@"Call Tweak Settings" forState:UIControlStateNormal];
-        b.titleLabel.font = [UIFont systemFontOfSize:14 weight:UIFontWeightMedium];
-        b.backgroundColor = [UIColor.secondarySystemBackgroundColor colorWithAlphaComponent:0.95];
-        b.layer.cornerRadius = BTN_HEIGHT / 2;
-        b.layer.borderWidth = 0.5;
-        b.layer.borderColor = UIColor.separatorColor.CGColor;
-        [b addTarget:[TweakActions class] action:@selector(openCallTweakSettingsModally)
-            forControlEvents:UIControlEventTouchUpInside];
-        [host addSubview:b];
+@interface TweakFloat : NSObject
++ (instancetype)shared;
+- (void)ensure;
+@end
+@implementation TweakFloat {
+    UIButton *_btn;
+}
++ (instancetype)shared {
+    static TweakFloat *f; static dispatch_once_t t;
+    dispatch_once(&t, ^{ f = [TweakFloat new]; });
+    return f;
+}
+- (void)ensure {
+    if (gFloatHidden) return;
+    UIWindow *w = ActiveWindow();
+    if (!w) return;
+    if (!_btn) {
+        _btn = [UIButton buttonWithType:UIButtonTypeCustom];
+        _btn.frame = CGRectMake(w.bounds.size.width - 54, w.safeAreaInsets.top + 110, 44, 44);
+        _btn.backgroundColor = [[UIColor systemBlueColor] colorWithAlphaComponent:0.78];
+        _btn.layer.cornerRadius = 22;
+        [_btn setTitle:@"🎧" forState:UIControlStateNormal];
+        _btn.titleLabel.font = [UIFont systemFontOfSize:22];
+        [_btn addTarget:self action:@selector(tap) forControlEvents:UIControlEventTouchUpInside];
+        [_btn addGestureRecognizer:[[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(pan:)]];
+        UILongPressGestureRecognizer *lp = [[UILongPressGestureRecognizer alloc] initWithTarget:self action:@selector(hide:)];
+        lp.minimumPressDuration = 1.5;
+        [_btn addGestureRecognizer:lp];
     }
-    CGRect r = host.bounds;
-    b.frame = CGRectMake((r.size.width - BTN_WIDTH) / 2.0,
-                         r.size.height - host.safeAreaInsets.bottom - BTN_BOTTOM_GAP - BTN_HEIGHT,
-                         BTN_WIDTH, BTN_HEIGHT);
-    [host bringSubviewToFront:b];
+    if (_btn.superview != w) { [_btn removeFromSuperview]; [w addSubview:_btn]; }
+    [w bringSubviewToFront:_btn];
+}
+- (void)tap { [TweakActions openCallTweakSettingsModally]; }
+- (void)pan:(UIPanGestureRecognizer *)g {
+    UIView *v = g.view; CGPoint t = [g translationInView:v.superview];
+    v.center = CGPointMake(v.center.x + t.x, v.center.y + t.y);
+    [g setTranslation:CGPointZero inView:v.superview];
+}
+- (void)hide:(UILongPressGestureRecognizer *)g {
+    if (g.state != UIGestureRecognizerStateBegan) return;
+    gFloatHidden = YES;               // until the next app launch
+    [_btn removeFromSuperview];
+}
+@end
+
+static void ShowToast(NSString *text) {
+    UIWindow *w = ActiveWindow();
+    if (!w) return;
+    UILabel *l = [UILabel new];
+    l.numberOfLines = 0;
+    l.text = text;
+    l.font = [UIFont systemFontOfSize:12 weight:UIFontWeightMedium];
+    l.textColor = UIColor.whiteColor;
+    l.textAlignment = NSTextAlignmentCenter;
+    l.backgroundColor = [UIColor.blackColor colorWithAlphaComponent:0.82];
+    l.layer.cornerRadius = 10;
+    l.clipsToBounds = YES;
+    CGFloat maxW = w.bounds.size.width - 40;
+    CGSize s = [l sizeThatFits:CGSizeMake(maxW - 20, CGFLOAT_MAX)];
+    l.frame = CGRectMake(20, w.safeAreaInsets.top + 8, maxW, s.height + 16);
+    [w addSubview:l];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 7 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+        [UIView animateWithDuration:0.3 animations:^{ l.alpha = 0; } completion:^(BOOL f) { [l removeFromSuperview]; }];
+    });
+}
+
+static void ScheduleToast(int tries) {
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+        if (!ActiveWindow() && tries > 0) { ScheduleToast(tries - 1); return; }
+        ShowToast([@"TelegramCallTweak загружен\n" stringByAppendingString:HookStatus()]);
+    });
 }
 
 #pragma mark - Hook installation (idempotent, retried as images load)
@@ -362,32 +419,24 @@ static Class FindClass(const char *needle) {
 }
 
 static void TryInstall(void) {
-    static BOOL dAudio, dVideo, dSession, dVC;
     @synchronized ([TweakActions class]) {
-        if (!dAudio) {
+        if (!gHookAudio) {
             Class c = FindClass("OngoingCallThreadLocalContextWebrtc");
             if (c && HookMethod(c, NSSelectorFromString(@"addExternalAudioData:"), (IMP)hook_addExternalAudioData, (IMP *)&orig_addExternalAudioData)) {
-                dAudio = YES; LOG(@"Hooked %s addExternalAudioData:", class_getName(c));
+                gHookAudio = YES; LOG(@"Hooked %s addExternalAudioData:", class_getName(c));
             }
         }
-        if (!dVideo) {
+        if (!gHookVideo) {
             Class c = FindClass("OngoingCallThreadLocalContextVideoCapturer");
             if (c && HookMethod(c, NSSelectorFromString(@"submitSampleBuffer:rotation:completion:"), (IMP)hook_submitSampleBuffer, (IMP *)&orig_submitSampleBuffer)) {
-                dVideo = YES; LOG(@"Hooked %s submitSampleBuffer", class_getName(c));
+                gHookVideo = YES; LOG(@"Hooked %s submitSampleBuffer", class_getName(c));
             }
         }
-        if (!dSession) {
+        if (!gHookSession) {
             Class c = [AVAudioSession class];
             BOOL a = HookMethod(c, @selector(categoryOptions), (IMP)hook_categoryOptions, (IMP *)&orig_categoryOptions);
             BOOL b = HookMethod(c, @selector(setCategory:mode:options:error:), (IMP)hook_setCategory, (IMP *)&orig_setCategory);
-            if (a && b) { dSession = YES; LOG(@"Hooked AVAudioSession"); }
-        }
-        if (!dVC) {
-            Class c = FindClass("PeerInfoScreenImpl");
-            if (!c) c = [UIViewController class];     // fallback: filtered by class name in the hook
-            if (HookMethod(c, @selector(viewDidLayoutSubviews), (IMP)hook_viewDidLayoutSubviews, (IMP *)&orig_viewDidLayoutSubviews)) {
-                dVC = YES; LOG(@"Hooked viewDidLayoutSubviews on %s", class_getName(c));
-            }
+            if (a && b) { gHookSession = YES; LOG(@"Hooked AVAudioSession"); }
         }
     }
 }
@@ -412,4 +461,8 @@ __attribute__((constructor)) static void TweakInit(void) {
     TryInstall();
     _dyld_register_func_for_add_image(ImageAdded);
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 4 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{ TryInstall(); });
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [NSTimer scheduledTimerWithTimeInterval:2.0 repeats:YES block:^(NSTimer *t) { [[TweakFloat shared] ensure]; }];
+        ScheduleToast(10);
+    });
 }
