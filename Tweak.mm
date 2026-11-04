@@ -200,13 +200,15 @@ static void hook_submitSampleBuffer(id self, SEL _cmd, CMSampleBufferRef sb, NSI
 #pragma mark - Settings UI
 
 static BOOL gHookAudio = NO, gHookVideo = NO, gHookSession = NO, gHookSettings = NO, gHookMic = NO;
+static BOOL gMicRebindEnabled = NO;                // mic hook is installed only when mic volume != 100%
+static void EnableMicHook(void);
 static BOOL gRowWanted = NO;                       // a profile/settings screen is on screen
 static NSHashTable *gVisibleProfiles;              // weak: visible PeerInfoScreenImpl instances
 static void RefreshSettingsRow(void);
 
 static NSString *HookStatus(void) {
     return [NSString stringWithFormat:@"Hooks: звук экрана %@ · видео %@ · аудиосессия %@ · экран настроек %@ · усиление микрофона %@",
-            gHookAudio ? @"✓" : @"✗", gHookVideo ? @"✓" : @"✗", gHookSession ? @"✓" : @"✗", gHookSettings ? @"✓" : @"✗", gHookMic ? @"✓" : @"✗"];
+            gHookAudio ? @"✓" : @"✗", gHookVideo ? @"✓" : @"✗", gHookSession ? @"✓" : @"✗", gHookSettings ? @"✓" : @"✗", gMicRebindEnabled ? (gHookMic ? @"✓" : @"✗") : @"выкл (100%)"];
 }
 
 @interface TweakSettingsViewController : UIViewController <UITableViewDataSource, UITableViewDelegate>
@@ -316,6 +318,7 @@ static NSString *HookStatus(void) {
 - (void)micSliderChanged:(UISlider *)s {
     float v = roundf(s.value);
     gMicVol = v; SavePref(kMicVol, @(v));
+    if (fabsf(v - 100.f) >= 0.5f) EnableMicHook();
     self.micLabel.text = [NSString stringWithFormat:@"Microphone Voice Volume (%.0f%%)", v];
 }
 - (void)mediaSliderChanged:(UISlider *)s {
@@ -551,24 +554,35 @@ static void hook_viewDidDisappear(id self, SEL _cmd, BOOL animated) {
 // gHookMic is declared with the other status flags above.
 static OSStatus (*orig_AudioUnitRender)(AudioUnit, AudioUnitRenderActionFlags *, const AudioTimeStamp *, UInt32, UInt32, AudioBufferList *);
 
-static void ScaleMic(AudioUnit unit, AudioBufferList *io, float g) {
-    static AudioUnit sUnit = NULL;
-    static int sKind = 0;                       // 1 = int16 PCM, 2 = float32 PCM
-    if (unit != sUnit) {
-        AudioStreamBasicDescription f; UInt32 sz = sizeof(f);
-        sKind = 0;
-        if (AudioUnitGetProperty(unit, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Output, 1, &f, &sz) == noErr
-            && f.mFormatID == kAudioFormatLinearPCM) {
-            if ((f.mFormatFlags & kAudioFormatFlagIsSignedInteger) && f.mBitsPerChannel == 16) sKind = 1;
-            else if ((f.mFormatFlags & kAudioFormatFlagIsFloat) && f.mBitsPerChannel == 32) sKind = 2;
-        }
-        sUnit = unit;
+static std::atomic<AudioUnit> gMicUnit{NULL};        // unit whose sample format is known
+static std::atomic<int>       gMicKind{0};           // 1 = int16 PCM, 2 = float32 PCM, 0 = unknown/unsupported
+static std::atomic<AudioUnit> gPendingUnit{NULL};    // seen in the render callback, format not queried yet
+
+// Runs on the main thread (timer). Never query CoreAudio from inside the render callback:
+// that thread serves both microphone and speaker, and blocking it silences the whole call.
+static void ResolveMicFormat(void) {
+    AudioUnit u = gPendingUnit.load();
+    if (!u || u == gMicUnit.load()) return;
+    AudioStreamBasicDescription f; UInt32 sz = sizeof(f);
+    int kind = 0;
+    if (AudioUnitGetProperty(u, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Output, 1, &f, &sz) == noErr
+        && f.mFormatID == kAudioFormatLinearPCM) {
+        if ((f.mFormatFlags & kAudioFormatFlagIsSignedInteger) && f.mBitsPerChannel == 16) kind = 1;
+        else if ((f.mFormatFlags & kAudioFormatFlagIsFloat) && f.mBitsPerChannel == 32) kind = 2;
     }
-    if (!sKind) return;
+    gMicKind.store(kind);
+    gMicUnit.store(u);
+}
+
+// Real-time safe: only atomics and arithmetic.
+static void ScaleMic(AudioUnit unit, AudioBufferList *io, float g) {
+    if (unit != gMicUnit.load()) { gPendingUnit.store(unit); return; }   // format not known yet: pass through
+    int kind = gMicKind.load();
+    if (!kind) return;
     for (UInt32 b = 0; b < io->mNumberBuffers; b++) {
         AudioBuffer *buf = &io->mBuffers[b];
         if (!buf->mData) continue;
-        if (sKind == 1) {
+        if (kind == 1) {
             int16_t *p = (int16_t *)buf->mData;
             UInt32 n = buf->mDataByteSize / sizeof(int16_t);
             for (UInt32 i = 0; i < n; i++) {
@@ -664,6 +678,14 @@ static void RebindImage(const struct mach_header *header, intptr_t slide) {
     }
 }
 
+static void EnableMicHook(void) {
+    if (gMicRebindEnabled) return;
+    gMicRebindEnabled = YES;
+    uint32_t n = _dyld_image_count();
+    for (uint32_t i = 0; i < n; i++) RebindImage(_dyld_get_image_header(i), _dyld_get_image_vmaddr_slide(i));
+    LOG(@"Mic hook enabled (%@)", gHookMic ? @"rebound" : @"nothing rebound");
+}
+
 #pragma mark - Hook installation (idempotent, retried as images load)
 
 static BOOL HookMethod(Class c, SEL sel, IMP imp, IMP *orig) {
@@ -735,7 +757,7 @@ static void ScheduleInstall(void) {
         TryInstall();
     });
 }
-static void ImageAdded(const struct mach_header *h, intptr_t slide) { RebindImage(h, slide); ScheduleInstall(); }
+static void ImageAdded(const struct mach_header *h, intptr_t slide) { if (gMicRebindEnabled) RebindImage(h, slide); ScheduleInstall(); }
 
 __attribute__((constructor)) static void TweakInit(void) {
     LOG(@"Dynamic swizzler initializing...");
@@ -749,7 +771,8 @@ __attribute__((constructor)) static void TweakInit(void) {
     _dyld_register_func_for_add_image(ImageAdded);
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 4 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{ TryInstall(); });
     dispatch_async(dispatch_get_main_queue(), ^{
-        [NSTimer scheduledTimerWithTimeInterval:2.0 repeats:YES block:^(NSTimer *t) { [[TweakFloat shared] ensure]; }];
+        [NSTimer scheduledTimerWithTimeInterval:2.0 repeats:YES block:^(NSTimer *t) { [[TweakFloat shared] ensure]; ResolveMicFormat(); }];
+        if (fabsf(gMicVol.load() - 100.f) >= 0.5f) EnableMicHook();
         ScheduleToast(10);
     });
 }
